@@ -1,0 +1,425 @@
+from utils import Utils
+import numpy as np
+
+#add the baselines from the pyod package
+from pyod.models.iforest import IForest
+from pyod.models.ocsvm import OCSVM
+from pyod.models.abod import ABOD
+from pyod.models.cblof import CBLOF
+from pyod.models.cof import COF
+from pyod.models.combination import aom
+from pyod.models.copod import COPOD
+from pyod.models.ecod import ECOD
+from pyod.models.feature_bagging import FeatureBagging
+from pyod.models.hbos import HBOS
+from pyod.models.knn import KNN
+from pyod.models.lmdd import LMDD
+from pyod.models.loda import LODA
+from pyod.models.lof import LOF
+from pyod.models.loci import LOCI
+from pyod.models.lscp import LSCP
+from pyod.models.mad import MAD
+from pyod.models.mcd import MCD
+from pyod.models.pca import PCA
+from pyod.models.rod import ROD
+from pyod.models.sod import SOD
+from pyod.models.sos import SOS
+from pyod.models.vae import VAE
+from pyod.models.auto_encoder_torch import AutoEncoder
+from pyod.models.so_gaal import SO_GAAL
+from pyod.models.mo_gaal import MO_GAAL
+from pyod.models.xgbod import XGBOD
+from pyod.models.deep_svdd import DeepSVDD
+from sklearn.preprocessing import label_binarize, StandardScaler
+
+
+class PYOD():
+    def __init__(self, seed, model_name, classes, tune=False):
+        '''
+        :param seed: seed for reproducible results
+        :param model_name: model name
+        :param tune: if necessary, tune the hyper-parameter based on the validation set constructed by the labeled anomalies
+        '''
+        self.seed = seed
+        self.utils = Utils()
+
+        self.model_name = model_name
+        self.model_dict = {'IForest':IForest, 'OCSVM':OCSVM, 'ABOD':ABOD, 'CBLOF':CBLOF, 'COF':COF, 'AOM':aom,
+                           'COPOD':COPOD, 'ECOD':ECOD,  'FeatureBagging':FeatureBagging, 'HBOS':HBOS, 'KNN':KNN,
+                           'LMDD':LMDD, 'LODA':LODA, 'LOF':LOF, 'LOCI':LOCI, 'LSCP':LSCP, 'MAD':MAD,
+                           'MCD':MCD, 'PCA':PCA, 'ROD':ROD, 'SOD':SOD, 'SOS':SOS, 'VAE':VAE, 'DeepSVDD': DeepSVDD,
+                           'AutoEncoder': AutoEncoder, 'SOGAAL': SO_GAAL, 'MOGAAL': MO_GAAL,'XGBOD': XGBOD}
+
+        self.tune = tune
+        self.models = {}
+        self.scalers = {}
+        self.classes = classes
+
+    def grid_hp(self, model_name):
+        '''
+        define the hyper-parameter search grid for different unsupervised mdoel
+        '''
+
+        param_grid_dict = {'IForest': [10, 50, 100, 500], # n_estimators, default=100
+                           'OCSVM': ['linear', 'poly', 'rbf', 'sigmoid'], # kernel, default='rbf',
+                           'ABOD': [3, 5, 7, 9], # n_neighbors, default=5
+                           'CBLOF': [4, 6, 8, 10], # n_clusters, default=8
+                           'COF': [5, 10, 20, 50], # n_neighbors, default=20
+                           'AOM': None,
+                           'COPOD': None,
+                           'ECOD': None,
+                           'FeatureBagging': [3, 5, 10, 20], # n_estimators, default=10
+                           'HBOS': [3, 5, 10, 20], # n_bins, default=10
+                           'KNN': [3, 5, 10, 20], # n_neighbors, default=5
+                           'LMDD': ['aad', 'var', 'iqr'], # dis_measure, default='aad'
+                           'LODA': [3, 5, 10, 20], # n_bins, default=10
+                           'LOF': [5, 10, 20, 50], # n_neighbors, default=20
+                           'LOCI': [0.1, 0.25, 0.5, 0.75], # alpha, default=0.5
+                           'LSCP': [3, 5, 10, 20], # n_bins, default=10
+                           'MAD': None,
+                           'MCD': None,
+                           'PCA': [0.25, 0.5, 0.75, None], # n_components
+                           'ROD': None,
+                           'SOD': [5, 10, 20, 50], # n_neighbors, default=20
+                           'SOS': [2.5, 4.5, 7.5, 10.0], # perplexity, default=4.5
+                           'VAE': None,
+                           'AutoEncoder': None,
+                           'SOGAAL': [10, 20, 50, 100], # stop_epochs, default=20
+                           'MOGAAL': [10, 20, 50, 100], # stop_epochs, default=20
+                           'XGBOD': None,
+                           'DeepSVDD': [20, 50, 100, 200] # epochs, default=100
+                           }
+        print("grid_hp PYOD")
+        return param_grid_dict[model_name]
+
+    def grid_search(self, X_train, y_train, X_val, y_val, ratio=None):
+        '''
+        implement the grid search for unsupervised models and return the best hyper-parameters
+        the ratio could be the ground truth anomaly ratio of input dataset
+        '''
+
+        # set seed
+        self.utils.set_seed(self.seed)
+        # get the hyper-parameter grid
+        param_grid = self.grid_hp(self.model_name)
+
+        if param_grid is not None:
+            # index of normal ana abnormal samples
+            idx_a = np.where(y_train==1)[0]
+            idx_n = np.where(y_train==0)[0]
+            idx_n = np.random.choice(idx_n, int((len(idx_a) * (1-ratio)) / ratio), replace=True)
+
+            idx = np.append(idx_n, idx_a) #combine
+            np.random.shuffle(idx) #shuffle
+
+            # valiation set (and the same anomaly ratio as in the original dataset)
+            X_val = X_train[idx]
+            y_val = y_train[idx]
+
+            # fitting
+            metric_list = []
+            for param in param_grid:
+                try:
+                    if self.model_name == 'IForest':
+                        model = self.model_dict[self.model_name](n_estimators=param).fit(X_train)
+
+                    elif self.model_name == 'OCSVM':
+                        model = self.model_dict[self.model_name](kernel=param).fit(X_train)
+
+                    elif self.model_name == 'ABOD':
+                        model = self.model_dict[self.model_name](n_neighbors=param).fit(X_train)
+
+                    elif self.model_name == 'CBLOF':
+                        model = self.model_dict[self.model_name](n_clusters=param).fit(X_train)
+
+                    elif self.model_name == 'COF':
+                        model = self.model_dict[self.model_name](n_neighbors=param).fit(X_train)
+
+                    elif self.model_name == 'FeatureBagging':
+                        model = self.model_dict[self.model_name](n_estimators=param).fit(X_train)
+
+                    elif self.model_name == 'HBOS':
+                        model = self.model_dict[self.model_name](n_bins=param).fit(X_train)
+
+                    elif self.model_name == 'KNN':
+                        model = self.model_dict[self.model_name](n_neighbors=param).fit(X_train)
+
+                    elif self.model_name == 'LMDD':
+                        model = self.model_dict[self.model_name](dis_measure=param).fit(X_train)
+
+                    elif self.model_name == 'LODA':
+                        model = self.model_dict[self.model_name](n_bins=param).fit(X_train)
+
+                    elif self.model_name == 'LOF':
+                        model = self.model_dict[self.model_name](n_neighbors=param).fit(X_train)
+
+                    elif self.model_name == 'LOCI':
+                        model = self.model_dict[self.model_name](alpha=param).fit(X_train)
+
+                    elif self.model_name == 'LSCP':
+                        model = self.model_dict[self.model_name](detector_list=[LOF(),LOF()], n_bins=param).fit(X_train)
+
+                    elif self.model_name == 'PCA':
+                        model = self.model_dict[self.model_name](n_components=param).fit(X_train)
+
+                    elif self.model_name == 'SOD':
+                        model = self.model_dict[self.model_name](n_neighbors=param).fit(X_train)
+
+                    elif self.model_name == 'SOS':
+                        model = self.model_dict[self.model_name](perplexity=param).fit(X_train)
+
+                    elif self.model_name == 'SOGAAL':
+                        model = self.model_dict[self.model_name](stop_epochs=param).fit(X_train)
+
+                    elif self.model_name == 'MOGAAL':
+                        model = self.model_dict[self.model_name](stop_epochs=param).fit(X_train)
+
+                    elif self.model_name == 'DeepSVDD':
+                        model = self.model_dict[self.model_name](epochs=param).fit(X_train)
+
+                    else:
+                        raise NotImplementedError
+
+                except:
+                    metric_list.append(0.0)
+                    continue
+
+                try:
+                    # model performance on the validation set
+                    score_val = model.decision_function(X_val)
+                    #  val_probs , test_probs  = self.clf.predict_score(self.data['X_test'],self.data['X_val'])
+                    metric = self.utils.metric(y_true=y_val, y_score=score_val, pos_label=1)
+                    metric_list.append(metric['aucpr'])
+
+                except:
+                    metric_list.append(0.0)
+                    continue
+
+            best_param = param_grid[np.argmax(metric_list)]
+
+        else:
+            metric_list = None
+            best_param = None
+
+        print(f'The candidate hyper-parameter of {self.model_name}: {param_grid},',
+              f' corresponding metric: {metric_list}',
+              f' the best candidate: {best_param}')
+
+        return best_param
+
+    # def fit(self, X_train, y_train, X_val, y_val, degree, gamma, coef0, tol, nu): #OCSVM
+    def fit(self, X_train, y_train, **kwargs): #PCA
+        if self.model_name in ['AutoEncoder', 'VAE']:
+            # only use the normal samples to fit the model
+            idx_n = np.where(y_train==0)[0]
+            X_train = X_train[idx_n]
+            y_train = y_train[idx_n]
+            
+            batch_size = kwargs.get("batch_size", 10)
+            hidden_neurons = kwargs.get("hidden_neurons", None)
+            weight_decay = kwargs.get("weight_decay", 'Adam')
+            hidden_activation =kwargs.get("hidden_activation", 'linear')
+            self.model = self.model_dict[self.model_name](batch_size=batch_size, hidden_neurons=hidden_neurons, hidden_activation=hidden_activation, weight_decay=weight_decay).fit(X_train)
+
+            
+        elif self.model_name == 'IForest':
+            for cls in self.classes:
+                X_cls = X_train[y_train == cls]
+                scaler = StandardScaler()
+                X_scaled = scaler.fit_transform(X_cls)
+                n_estimators = kwargs.get("n_estimators", 10)
+                max_samples = kwargs.get("max_samples", 50)
+                contamination = kwargs.get("contamination", 0.1)
+                max_features = kwargs.get("max_features", 0.5)
+                self.model = self.model_dict[self.model_name](n_estimators=n_estimators, max_samples=max_samples, contamination=contamination, max_features=max_features).fit(X_scaled)
+                self.models[cls] = self.model
+                self.scalers[cls] = scaler
+
+        elif self.model_name == 'PCA':
+            for cls in self.classes:
+                X_cls = X_train[y_train == cls]
+                scaler = StandardScaler()
+                X_scaled = scaler.fit_transform(X_cls)
+                contamination = kwargs.get("contamination", 0.1)
+                svd_solver = kwargs.get("svd_solver", "auto")
+                n_components = kwargs.get("n_components", 5)
+                self.model = self.model_dict[self.model_name](contamination=contamination, svd_solver=svd_solver, n_components=n_components).fit(X_scaled)
+                self.models[cls] = self.model
+                self.scalers[cls] = scaler
+                
+        elif self.model_name == 'OCSVM':
+            for cls in self.classes:
+                X_cls = X_train[y_train == cls]
+                scaler = StandardScaler()
+                X_scaled = scaler.fit_transform(X_cls)
+                degree = kwargs.get("degree", 2)
+                gamma = kwargs.get("gamma", "scale")
+                coef0 = kwargs.get("coef0", 0.0)
+                tol = kwargs.get("tol", 1e-4)
+                nu = kwargs.get("nu", 0.1)
+                self.model = self.model_dict[self.model_name]( degree=degree, gamma=gamma, coef0=coef0, tol=tol, nu=nu).fit(X_scaled)
+                self.models[cls] = self.model
+                self.scalers[cls] = scaler
+        
+        elif self.model_name == 'KNN':
+            contamination = kwargs.get("contamination", 0.1)
+            n_neighbors = kwargs.get("n_neighbors", 5)
+            method = kwargs.get("method", 'largest')
+            self.model = self.model_dict[self.model_name](contamination=contamination, n_neighbors=n_neighbors, method=method).fit(X_train, y_train)
+            
+        elif self.model_name == 'LOF':
+            contamination = kwargs.get("contamination", 0.05)
+            n_neighbors = kwargs.get("n_neighbors", 5)
+            algorithm = kwargs.get("algorithm", 'auto')
+            self.model = self.model_dict[self.model_name](contamination=contamination, n_neighbors=n_neighbors, algorithm=algorithm).fit(X_train, y_train)
+            
+        # # selecting the best hyper-parameters of unsupervised model for fair comparison (if labeled anomalies is available)
+        # if sum(y_train) > 0 and self.tune:
+        #     assert ratio is not None
+        #     best_param = self.grid_search(X_train, y_train, X_val, y_val, ratio)
+        # else:
+        #     best_param = None
+
+        # print(f'best param: {best_param}')
+        # best_param = None
+        # # set seed
+        # self.utils.set_seed(self.seed)
+        # # fit best on the best param
+        # if best_param is not None:
+        #     if self.model_name == 'IForest':
+        #         self.model = self.model_dict[self.model_name](n_estimators=n_estimators, max_samples=max_samples, contamination=contamination, max_features=max_features).fit(X_train)
+
+        #     elif self.model_name == 'OCSVM':
+        #         self.model = self.model_dict[self.model_name](kernel=best_param, degree=degree, gamma=gamma, coef0=coef0, tol=tol, nu=nu).fit(X_train)
+            
+        #     elif self.model_name == 'ABOD':
+        #         self.model = self.model_dict[self.model_name](n_neighbors=best_param).fit(X_train)
+
+        #     elif self.model_name == 'CBLOF':
+        #         self.model = self.model_dict[self.model_name](n_clusters=best_param).fit(X_train)
+
+        #     elif self.model_name == 'COF':
+        #         self.model = self.model_dict[self.model_name](n_neighbors=best_param).fit(X_train)
+
+        #     elif self.model_name == 'FeatureBagging':
+        #         self.model = self.model_dict[self.model_name](n_estimators=best_param).fit(X_train)
+
+        #     elif self.model_name == 'HBOS':
+        #         self.model = self.model_dict[self.model_name](n_bins=best_param).fit(X_train)
+
+        #     elif self.model_name == 'KNN':
+        #         self.model = self.model_dict[self.model_name](n_neighbors=best_param).fit(X_train)
+
+        #     elif self.model_name == 'LMDD':
+        #         self.model = self.model_dict[self.model_name](dis_measure=best_param).fit(X_train)
+
+        #     elif self.model_name == 'LODA':
+        #         self.model = self.model_dict[self.model_name](n_bins=best_param).fit(X_train)
+
+        #     elif self.model_name == 'LOF':
+        #         self.model = self.model_dict[self.model_name](n_neighbors=best_param).fit(X_train)
+
+        #     elif self.model_name == 'LOCI':
+        #         self.model = self.model_dict[self.model_name](alpha=best_param).fit(X_train)
+
+        #     elif self.model_name == 'LSCP':
+        #         self.model = self.model_dict[self.model_name](detector_list=[LOF(), LOF()], n_bins=best_param).fit(X_train)
+
+        #     elif self.model_name == 'PCA':
+        #         self.model = self.model_dict[self.model_name](n_components=best_param).fit(X_train)
+
+        #     elif self.model_name == 'SOD':
+        #         self.model = self.model_dict[self.model_name](n_neighbors=best_param).fit(X_train)
+
+        #     elif self.model_name == 'SOS':
+        #         self.model = self.model_dict[self.model_name](perplexity=best_param).fit(X_train)
+
+        #     elif self.model_name == 'SOGAAL':
+        #         self.model = self.model_dict[self.model_name](stop_epochs=best_param).fit(X_train)
+
+        #     elif self.model_name == 'MOGAAL':
+        #         self.model = self.model_dict[self.model_name](stop_epochs=best_param).fit(X_train)
+
+        #     elif self.model_name == 'DeepSVDD':
+        #         self.model = self.model_dict[self.model_name](epochs=best_param).fit(X_train)
+
+        #     else:
+        #         raise NotImplementedError
+
+        else:
+            # unsupervised method would ignore the y labels
+            # self.model = self.model_dict[self.model_name](contamination=contamination, n_neighbors=n_neighbors, method=method).fit(X_train, y_train)
+            # self.model = self.model_dict[self.model_name](contamination=contamination, n_bins=n_bins, alpha=alpha, tol=tol).fit(X_train, y_train)
+            # self.model = self.model_dict[self.model_name](n_bins=n_bins, alpha=alpha, tol=tol, contamination=contamination).fit(X_train, y_train)
+            # self.model = self.model_dict[self.model_name]( degree=degree, gamma=gamma, coef0=coef0, tol=tol, nu=nu).fit(X_train, y_train)
+            # self.model = self.model_dict[self.model_name]( act_fun=act_fun, lr=lr, mom=mom).fit(X_train, y_train)
+            # self.model = self.model_dict[self.model_name](n_estimators=n_estimators, max_samples=max_samples, contamination=contamination, max_features=max_features).fit(X_train)
+            self.model = self.model_dict[self.model_name](contamination=contamination, svd_solver=svd_solver, n_components=n_components).fit(X_train, y_train)
+
+        return self
+
+    # from pyod: for consistency, outliers are assigned with larger anomaly scores
+    def predict_train_score(self, x_train):
+        score_train = self.model.decision_function(x_train) 
+        return score_train
+    
+    def predict_score(self, X_test, x_val):
+        score_test = self.model.decision_function(X_test)
+        score_val = self.model.decision_function(x_val)
+        return score_test , score_val
+    
+    def predict(self, X):
+        predictions = []
+        scores = []
+        for x in X:
+            sample_scores = {
+                cls: self.models[cls].decision_function(self.scalers[cls].transform([x]))[0]
+                for cls in self.classes
+            }
+            predictions.append(max(sample_scores, key=sample_scores.get))
+            scores.append([sample_scores[c] for c in self.classes])
+        return np.array(predictions), np.array(scores)
+    
+    def evaluate(self, X, y_true, stage='Test'):
+        from sklearn.metrics import (
+            classification_report, accuracy_score, precision_score, recall_score,
+            f1_score, confusion_matrix, roc_auc_score, average_precision_score
+        )
+        from sklearn.preprocessing import label_binarize
+        import pandas as pd
+
+        y_pred, y_scores = self.predict(X)
+
+        # One-hot encoding for AUC/PR
+        try:
+            y_true_bin = label_binarize(y_true, classes=self.classes)
+            aucroc = roc_auc_score(y_true_bin, y_scores, average='macro', multi_class='ovr')
+            aucpr = average_precision_score(y_true_bin, y_scores, average='macro')
+        except:
+            aucroc = None
+            aucpr = None
+
+        # Per-class metrics
+        class_report = classification_report(y_true, y_pred, labels=self.classes, output_dict=True, zero_division=0)
+        class_report_df = pd.DataFrame(class_report).transpose()
+
+        print(f"\n🔍 Per-Class Metrics ({stage}):\n")
+        print(class_report_df.loc[[str(cls) for cls in self.classes]])
+
+        # Lowercase stage name for keys
+        stage_key = stage.lower()
+
+        results = {
+            f'{stage_key}_aucroc': aucroc,
+            f'{stage_key}_aucpr': aucpr,
+            f'{stage_key}_accuracy': accuracy_score(y_true, y_pred),
+            f'{stage_key}_precision': precision_score(y_true, y_pred, average='macro', zero_division=0),
+            f'{stage_key}_recall': recall_score(y_true, y_pred, average='macro', zero_division=0),
+            f'{stage_key}_f1': f1_score(y_true, y_pred, average='weighted'),
+            f'{stage_key}_f1_macro': f1_score(y_true, y_pred, average='macro'),
+            f'{stage_key}_f1_micro': f1_score(y_true, y_pred, average='micro'),
+            f'{stage_key}_confusion_matrix': confusion_matrix(y_true, y_pred, labels=self.classes),
+            f'{stage_key}_per_class_metrics': class_report_df.loc[[str(cls) for cls in self.classes]]
+        }
+
+        return results
