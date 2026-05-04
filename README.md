@@ -170,6 +170,11 @@ python visualize.py
 ```
 
 ---
+## Detailed Results
+
+The full experimental results are available in the accompanying document:
+
+- 📄 [PDF report](results/supplementary_tables.pdf)
 
 ## 📌 Notes
 
